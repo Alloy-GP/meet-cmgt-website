@@ -8,6 +8,14 @@
 //   LEADS_FROM_EMAIL    — verified Resend sender on cmgt.org,
 //                         e.g. "CMGT <notifications@cmgt.org>"
 //
+// Optional — Slack log of every submission:
+//   FORM_SLACK_WEBHOOK  — incoming webhook for CMGT's own channel. Every
+//                         submission posts there, including ones where the
+//                         email send failed — that post is then the only
+//                         record of the lead. Unset = no Slack, and behaviour
+//                         is unchanged.
+//   FORM_ALERT_SLACK_URL — shared fallback, used only when the above is unset.
+//
 // Optional — Pipedrive (Person + Deal):
 //   PIPEDRIVE_API_TOKEN   — your Pipedrive personal API token
 //   PIPEDRIVE_OWNER_ID    — Pipedrive user ID to own new leads (Person/Deal/Org).
@@ -17,6 +25,53 @@
 
 import { Resend } from 'resend';
 import crypto from 'crypto';
+
+/**
+ * Post a submission to CMGT's Slack channel.
+ *
+ * This site is a standalone serverless function rather than one of the Astro
+ * builds, so it carries its own copy rather than importing src/lib/form-alert.ts
+ * — there is no src/ here to import from.
+ *
+ * `delivered: false` still posts: if Resend refused the send, this message is
+ * the only surviving copy of what someone typed, so suppressing it would lose
+ * the lead. Never throws — logging must not break a request that already
+ * succeeded.
+ */
+async function notifySubmission({ fields, route, formName, delivered = true }) {
+  const url = process.env.FORM_SLACK_WEBHOOK || process.env.FORM_ALERT_SLACK_URL;
+  if (!url) return;
+
+  const heading = `${delivered ? '📬' : '⚠️'} ${route} — CMGT`;
+  const rows = (fields || [])
+    .filter(([, v]) => v)
+    .map(([k, v]) => `*${k}:* ${v.length > 220 ? v.slice(0, 220) + '…' : v}`)
+    .join('\n');
+
+  const blocks = [{ type: 'header', text: { type: 'plain_text', text: heading } }];
+  if (rows) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: rows } });
+  blocks.push({
+    type: 'context',
+    elements: [
+      {
+        type: 'mrkdwn',
+        text: delivered
+          ? `${formName} · delivered`
+          : `${formName} · *not delivered* — this message is the only record of the submission`,
+      },
+    ],
+  });
+
+  try {
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: heading, blocks }),
+    });
+  } catch (err) {
+    console.error('[slack] failed to post submission:', err);
+  }
+}
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
@@ -245,6 +300,16 @@ export default async function handler(req, res) {
     .map((s) => s.trim())
     .filter(Boolean);
 
+  const slackFields = [
+    ['Name', name],
+    ['Role', role],
+    ['Email', email],
+    ['Phone', phone],
+    ['Community', org],
+    ['Notes', notes],
+    ['Source', source],
+  ];
+
   try {
     const result = await resend.emails.send({
       from: process.env.LEADS_FROM_EMAIL || 'CMGT <notifications@cmgt.org>',
@@ -285,8 +350,22 @@ export default async function handler(req, res) {
 
     if (result.error) {
       console.error('[resend] error:', result.error);
+      // Post before returning: Resend refused the send, so this is the only
+      // place the lead survives.
+      await notifySubmission({
+        route: 'Meet CMGT lead',
+        formName: `Intended for ${leadsTo.join(', ')}`,
+        delivered: false,
+        fields: slackFields,
+      });
       return res.status(502).json({ error: 'Email service rejected the request.' });
     }
+
+    await notifySubmission({
+      route: 'Meet CMGT lead',
+      formName: `Delivered to ${leadsTo.join(', ')}`,
+      fields: slackFields,
+    });
 
     // Subscribe to Mailchimp (fire-and-forget — never blocks the response).
     subscribeToMailchimp({ email, name, role, org });
